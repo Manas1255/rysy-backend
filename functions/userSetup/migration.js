@@ -1,652 +1,239 @@
 /**
- * User ID migration: copies Firestore documents and Storage files from
- * oldUserId to newUserId, rewrites imageUrl/userId in entries, then deletes old docs.
+ * User ID migration: migrates guest user data to a real authenticated user.
+ * - Updates the user document's id field to newUserId
+ * - Updates userId in daily_tasks, face-analysis, meal-analysis collections
  */
 
-const {getStorage} = require("firebase-admin/storage");
 const {getFirestore} = require("firebase-admin/firestore");
-const crypto = require("crypto");
 
-const COLLECTIONS = ["users", "daily_tasks", "face-analysis", "meal-analysis", "videos"];
-const STORAGE_FOLDERS = ["selfies", "meals"];
-const USERS_ID_FIELD = "id";
+// Logging utility for consistent prefixed logs
+const log = {
+  info: (...args) => console.log("[MIGRATION INFO]", ...args),
+  warn: (...args) => console.warn("[MIGRATION WARN]", ...args),
+  error: (...args) => console.error("[MIGRATION ERROR]", ...args),
+  debug: (...args) => console.log("[MIGRATION DEBUG]", ...args),
+};
 
-/**
- * Builds Firebase Storage download URL for a file path and token.
- * @param {string} bucketName - Bucket name (e.g. rysy-dev.firebasestorage.app)
- * @param {string} path - File path (e.g. selfies/userId/file.jpg)
- * @param {string} token - firebaseStorageDownloadTokens value
- * @returns {string}
- */
-function buildDownloadUrl(bucketName, path, token) {
-  const encoded = encodeURIComponent(path).replace(/%2F/g, "%2F");
-  return `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encoded}?alt=media&token=${token}`;
-}
+// Collections that need userId updated
+const COLLECTIONS_TO_UPDATE = ["daily_tasks", "face-analysis", "meal-analysis", "reel_progress"];
 
 /**
- * Copies all files from a storage folder prefix to a new prefix and returns
- * a map of old URL -> new URL for rewriting Firestore fields.
- * @param {object} bucket - GCS Bucket
- * @param {string} bucketName - Bucket name for URLs
- * @param {string} folder - Folder name (selfies or meals)
- * @param {string} oldUserId - Source user ID path segment
- * @param {string} newUserId - Dest user ID path segment
- * @returns {Promise<Map<string, string>>} oldUrl -> newUrl
+ * Finds the existing user document by document ID or by `id` field.
  */
-async function copyStorageFolder(bucket, bucketName, folder, oldUserId, newUserId) {
-  const prefix = `${folder}/${oldUserId}/`;
-  console.log("[copyStorageFolder] Starting folder copy", {
-    folder,
-    prefix,
-    oldUserId,
-    newUserId,
-  });
+async function findUserDoc(usersColl, searchId) {
+  log.info(`findUserDoc: Searching for user doc with searchId="${searchId}"`);
 
-  const [files] = await bucket.getFiles({prefix});
-  console.log("[copyStorageFolder] Found files", {
-    folder,
-    prefix,
-    fileCount: files.length,
-    fileNames: files.map((f) => f.name).slice(0, 10), // Log first 10 file names
-  });
+  // Try by document ID first
+  const byDocId = usersColl.doc(searchId);
+  const snap = await byDocId.get();
+  log.debug(`findUserDoc: Document lookup by ID="${searchId}", exists=${snap.exists}`);
 
-  const urlMap = new Map();
-
-  for (const file of files) {
-    if (!file.name || file.name === prefix) {
-      console.log("[copyStorageFolder] Skipping invalid file", {
-        folder,
-        fileName: file.name || "(empty)",
-      });
-      continue;
-    }
-
-    const fileName = file.name.slice(prefix.length);
-    if (!fileName) {
-      console.log("[copyStorageFolder] Skipping empty fileName", {
-        folder,
-        filePath: file.name,
-      });
-      continue;
-    }
-
-    const oldPath = file.name;
-    let oldUrl = "";
-
-    console.log("[copyStorageFolder] Processing file", {
-      folder,
-      oldPath,
-      fileName,
-    });
-
-    try {
-      const [oldMeta] = await file.getMetadata();
-      const meta = oldMeta && oldMeta.metadata ? oldMeta.metadata : {};
-      const oldToken = meta.firebaseStorageDownloadTokens || meta.firebaseStorageDownloadToken || "";
-      if (oldToken) {
-        oldUrl = buildDownloadUrl(bucketName, oldPath, oldToken);
-        console.log("[copyStorageFolder] Retrieved old URL", {
-          folder,
-          fileName,
-          hasOldUrl: !!oldUrl,
-        });
-      }
-    } catch (err) {
-      console.log("[copyStorageFolder] Could not get metadata, will use path mapping", {
-        folder,
-        fileName,
-        error: err.message,
-      });
-      // Use urlMap by path if metadata unavailable
-    }
-
-    const newPath = `${folder}/${newUserId}/${fileName}`;
-    const destFile = bucket.file(newPath);
-
-    console.log("[copyStorageFolder] Copying file", {
-      folder,
-      from: oldPath,
-      to: newPath,
-    });
-
-    await file.copy(destFile);
-
-    const [meta] = await destFile.getMetadata();
-    const metadata = (meta && meta.metadata) || {};
-    let token = metadata.firebaseStorageDownloadTokens || metadata.firebaseStorageDownloadToken;
-
-    if (!token) {
-      console.log("[copyStorageFolder] Generating new token", {
-        folder,
-        fileName,
-      });
-      token = crypto.randomUUID();
-      await destFile.setMetadata({metadata: {firebaseStorageDownloadTokens: token}});
-    }
-
-    const newUrl = buildDownloadUrl(bucketName, newPath, token);
-
-    if (oldUrl) {
-      urlMap.set(oldUrl, newUrl);
-      console.log("[copyStorageFolder] Added URL mapping (oldUrl -> newUrl)", {
-        folder,
-        fileName,
-        oldUrl,
-        newUrl,
-      });
-    }
-    urlMap.set(oldPath, newUrl);
-
-    console.log("[copyStorageFolder] File copy completed", {
-      folder,
-      fileName,
-      newUrl,
-    });
+  if (snap.exists) {
+    log.info(`findUserDoc: Found user doc by document ID="${searchId}"`);
+    const data = snap.data();
+    log.debug(`findUserDoc: User doc data keys: ${Object.keys(data || {}).join(", ")}`);
+    log.debug(`findUserDoc: User doc id field value: "${data?.id}"`);
+    return {ref: byDocId, data: data};
   }
 
-  console.log("[copyStorageFolder] Folder copy completed", {
-    folder,
-    filesProcessed: files.length,
-    urlMapSize: urlMap.size,
-  });
-
-  return urlMap;
-}
-
-/**
- * Copies all storage files from selfies/oldUserId and meals/oldUserId to
- * newUserId paths. Returns a combined map of old URL -> new URL.
- * @param {string} oldUserId
- * @param {string} newUserId
- * @returns {Promise<Map<string, string>>}
- */
-async function copyStorageForUser(oldUserId, newUserId) {
-  console.log("[copyStorageForUser] Starting storage copy", {
-    oldUserId,
-    newUserId,
-    folders: STORAGE_FOLDERS,
-  });
-
-  const storage = getStorage();
-  const bucket = storage.bucket();
-  const bucketName = bucket.name;
-
-  console.log("[copyStorageForUser] Storage initialized", {
-    bucketName,
-  });
-
-  const combined = new Map();
-
-  for (const folder of STORAGE_FOLDERS) {
-    console.log("[copyStorageForUser] Processing folder", {
-      folder,
-      oldUserId,
-      newUserId,
-    });
-
-    try {
-      const map = await copyStorageFolder(bucket, bucketName, folder, oldUserId, newUserId);
-      console.log("[copyStorageForUser] Folder copy completed", {
-        folder,
-        urlMapSize: map.size,
-      });
-      map.forEach((v, k) => combined.set(k, v));
-    } catch (err) {
-      console.error("[copyStorageForUser] Error copying folder", {
-        folder,
-        oldUserId,
-        error: err.message,
-        stack: err.stack,
-      });
-      console.warn("userSetup copyStorageForUser:", folder, oldUserId, err);
-    }
-  }
-
-  console.log("[copyStorageForUser] Storage copy completed", {
-    totalUrlMapSize: combined.size,
-    foldersProcessed: STORAGE_FOLDERS.length,
-  });
-
-  return combined;
-}
-
-/**
- * Rewrites imageUrl and userId in face-analysis or meal-analysis entries.
- * @param {object} data - Document data with entries array
- * @param {string} newUserId
- * @param {Map<string, string>} urlMap - oldUrl -> newUrl (and oldPath -> newUrl)
- */
-function rewriteEntries(data, newUserId, urlMap) {
-  if (!data || !Array.isArray(data.entries)) return data;
-  const entries = data.entries.map((entry) => {
-    const out = {...entry};
-    if (out.userId !== undefined) out.userId = newUserId;
-    if (typeof out.imageUrl === "string" && out.imageUrl) {
-      const newUrl = urlMap.get(out.imageUrl);
-      if (newUrl) out.imageUrl = newUrl;
-      else {
-        for (const [oldKey, newUrl] of urlMap) {
-          if (oldKey.length > 10 && (out.imageUrl.includes(oldKey) || out.imageUrl === oldKey)) {
-            out.imageUrl = newUrl;
-            break;
-          }
-        }
-      }
-    }
-    return out;
-  });
-  return {...data, entries};
-}
-
-/**
- * Builds an update object with only the fields that need to be changed (userId and imageUrl).
- * This ensures we only update specific fields without replacing the entire document.
- * Uses Firestore's dot notation for nested fields.
- * @param {object} originalData - Original document data
- * @param {string} oldUserId
- * @param {string} newUserId
- * @param {Map<string, string>} urlMap
- * @returns {object} Update object with only changed fields (using dot notation for nested)
- */
-function buildUpdateObject(originalData, oldUserId, newUserId, urlMap) {
-  console.log("[buildUpdateObject] Building update object", {
-    hasOriginalData: !!originalData,
-    originalDataType: typeof originalData,
-    oldUserId,
-    newUserId,
-    urlMapSize: urlMap.size,
-  });
-
-  if (!originalData || typeof originalData !== "object") {
-    console.log("[buildUpdateObject] No original data, returning userId only");
-    return {userId: newUserId};
-  }
-
-  // Always update the top-level userId field
-  const updateFields = {userId: newUserId};
-  console.log("[buildUpdateObject] Initial updateFields", {
-    updateFields,
-  });
-
-  // Handle entries array if it exists (for face-analysis and meal-analysis)
-  // Update imageUrl fields in entries, but entries don't have userId fields
-  if (Array.isArray(originalData.entries)) {
-    console.log("[buildUpdateObject] Found entries array", {
-      entriesLength: originalData.entries.length,
-    });
-
-    let entriesUpdated = false;
-    const updatedEntries = originalData.entries.map((entry, index) => {
-      if (!entry || typeof entry !== "object") return entry;
-
-      const updated = {...entry};
-      let entryChanged = false;
-
-      // Update imageUrl if it exists and references the old user ID
-      if (typeof updated.imageUrl === "string" && updated.imageUrl) {
-        const newUrl = urlMap.get(updated.imageUrl);
-        if (newUrl) {
-          updated.imageUrl = newUrl;
-          entryChanged = true;
-          console.log("[buildUpdateObject] Updated entry imageUrl from urlMap", {
-            index,
-            oldUrl: entry.imageUrl.substring(0, 100),
-            newUrl: newUrl.substring(0, 100),
-          });
-        } else if (updated.imageUrl.includes(oldUserId)) {
-          updated.imageUrl = updated.imageUrl.split(oldUserId).join(newUserId);
-          entryChanged = true;
-          console.log("[buildUpdateObject] Updated entry imageUrl by string replacement", {
-            index,
-            oldUrl: entry.imageUrl.substring(0, 100),
-            newUrl: updated.imageUrl.substring(0, 100),
-          });
-        }
-      }
-
-      if (entryChanged) {
-        entriesUpdated = true;
-      }
-
-      return updated;
-    });
-
-    // Only update entries array if we actually changed something
-    if (entriesUpdated) {
-      updateFields.entries = updatedEntries;
-      console.log("[buildUpdateObject] Set entries array update", {
-        entriesCount: updatedEntries.length,
-        entriesUpdated: true,
-      });
-    } else {
-      console.log("[buildUpdateObject] No changes needed in entries array", {
-        entriesCount: updatedEntries.length,
-      });
-    }
-  }
-
-  // Check for other top-level imageUrl fields (not in entries array)
-  if (typeof originalData.imageUrl === "string" && originalData.imageUrl) {
-    const newUrl = urlMap.get(originalData.imageUrl);
-    if (newUrl) {
-      updateFields.imageUrl = newUrl;
-      console.log("[buildUpdateObject] Updated top-level imageUrl from urlMap", {
-        oldUrl: originalData.imageUrl.substring(0, 100),
-        newUrl: newUrl.substring(0, 100),
-      });
-    } else if (originalData.imageUrl.includes(oldUserId)) {
-      updateFields.imageUrl = originalData.imageUrl.split(oldUserId).join(newUserId);
-      console.log("[buildUpdateObject] Updated top-level imageUrl by string replacement", {
-        oldUrl: originalData.imageUrl.substring(0, 100),
-        newUrl: updateFields.imageUrl.substring(0, 100),
-      });
-    }
-  }
-
-  console.log("[buildUpdateObject] Final updateFields", {
-    updateFields,
-    fieldCount: Object.keys(updateFields).length,
-  });
-
-  return updateFields;
-}
-
-// Collections to update userId in during migration
-// Note: Collection names use different separators (underscore vs dash) - this is intentional
-// and matches the actual Firestore collection names
-const SUBCOLLECTIONS_BY_USER_ID = ["daily_tasks", "face-analysis", "meal-analysis", "videos"];
-
-/**
- * Finds the existing user document to migrate: by document ID first, then by id field.
- * Returns { ref, data } or null. Ensures we resolve the actual document ID when the
- * client only knows the id field (e.g. auth UID) but the doc was created with .add().
- * @param {FirebaseFirestore.CollectionReference} usersColl
- * @param {string} oldUserId - Document ID or id field value to look up
- * @param {string} newUserId - Desired canonical user ID (e.g. auth UID)
- * @returns {Promise<{ ref: FirebaseFirestore.DocumentReference, data: object, actualOldUserId: string } | null>}
- */
-async function findUserDocToMigrate(usersColl, oldUserId, newUserId) {
-  console.log("[findUserDocToMigrate] Starting search", {
-    oldUserId: oldUserId || "(empty)",
-    newUserId,
-    searchStrategy: "byDocId_first",
-  });
-
-  // Only search by document ID if oldUserId is provided and different from newUserId
-  // If oldUserId is empty or equals newUserId, skip document ID search and go straight to id field search
-  const shouldSearchByDocId = oldUserId && oldUserId.trim() !== "" && oldUserId !== newUserId;
-
-  if (shouldSearchByDocId) {
-    const byDocId = usersColl.doc(oldUserId);
-    console.log("[findUserDocToMigrate] Checking document by ID", {
-      documentId: oldUserId,
-    });
-
-    const snap = await byDocId.get();
-
-    console.log("[findUserDocToMigrate] Document by ID result", {
-      documentId: oldUserId,
-      exists: snap.exists,
-    });
-
-    if (snap.exists) {
-      const data = snap.data();
-      console.log("[findUserDocToMigrate] Found by document ID", {
-        documentId: oldUserId,
-        dataKeys: Object.keys(data || {}),
-        idField: data?.[USERS_ID_FIELD],
-      });
-      return {ref: byDocId, data, actualOldUserId: oldUserId};
-    }
-  } else {
-    console.log("[findUserDocToMigrate] Skipping document ID search", {
-      reason: !oldUserId || oldUserId.trim() === "" ? "oldUserId is empty" : "oldUserId equals newUserId",
-      oldUserId: oldUserId || "(empty)",
-      newUserId,
-    });
-  }
-
-  // If oldUserId is provided, search by id field using oldUserId
-  // Otherwise, fall back to searching by newUserId (for cases where oldUserId wasn't provided)
-  const searchValue = oldUserId && oldUserId.trim() !== "" ? oldUserId : newUserId;
-
-  console.log("[findUserDocToMigrate] Not found by document ID, searching by id field", {
-    idField: USERS_ID_FIELD,
-    searchValue,
-    usingOldUserId: oldUserId && oldUserId.trim() !== "",
-  });
-
-  const byIdField = await usersColl.where(USERS_ID_FIELD, "==", searchValue).limit(1).get();
-
-  console.log("[findUserDocToMigrate] Query by id field result", {
-    idField: USERS_ID_FIELD,
-    searchValue,
-    foundCount: byIdField.size,
-  });
+  // Try by id field
+  log.debug(`findUserDoc: Document not found by ID, trying query where id=="${searchId}"`);
+  const byIdField = await usersColl.where("id", "==", searchId).limit(1).get();
+  log.debug(`findUserDoc: Query result empty=${byIdField.empty}, size=${byIdField.size}`);
 
   if (!byIdField.empty) {
     const doc = byIdField.docs[0];
-    console.log("[findUserDocToMigrate] Found by id field", {
-      documentId: doc.ref.id,
-      idFieldValue: doc.data()?.[USERS_ID_FIELD],
-      newUserId,
-    });
-
-    if (doc.ref.id !== newUserId) {
-      console.log("[findUserDocToMigrate] Document ID mismatch, will migrate", {
-        documentId: doc.ref.id,
-        idFieldValue: doc.data()?.[USERS_ID_FIELD],
-        newUserId,
-      });
-      return {ref: doc.ref, data: doc.data(), actualOldUserId: doc.ref.id};
-    } else {
-      console.log("[findUserDocToMigrate] Document ID matches newUserId, no migration needed");
-    }
+    log.info(`findUserDoc: Found user doc by id field. Doc ID="${doc.ref.id}"`);
+    return {ref: doc.ref, data: doc.data()};
   }
 
-  console.log("[findUserDocToMigrate] No user document found");
+  log.info(`findUserDoc: No user document found for searchId="${searchId}"`);
   return null;
 }
 
 /**
- * Performs full migration:
- * - Users: copy user doc to a new document whose document ID = newUserId and id field = newUserId
- *   (so document ID and id stay the same), then delete the old doc. Preserves email, subscription, etc.
- * - daily_tasks, face-analysis, meal-analysis, videos: only update userId field (and
- *   rewrite imageUrl where needed); do not delete or create documents.
- * @param {string} oldUserId
- * @param {string} newUserId
- * @param {FirebaseFirestore.Firestore} [db]
- * @returns {Promise<{ ok: boolean, error?: string }>}
+ * Lists all documents in a collection that match either oldUserId or newUserId.
+ * This helps us understand the current state of the collection.
+ */
+async function debugListCollectionDocs(firestore, collectionName, oldUserId, newUserId) {
+  log.info(`debugListCollectionDocs: Checking "${collectionName}" for both old and new userIds`);
+
+  const coll = firestore.collection(collectionName);
+
+  // Check for oldUserId
+  const oldSnapshot = await coll.where("userId", "==", oldUserId).get();
+  log.info(`debugListCollectionDocs: "${collectionName}" docs with userId="${oldUserId}": ${oldSnapshot.size}`);
+  for (const doc of oldSnapshot.docs) {
+    log.debug(`  - Doc ID="${doc.id}", userId="${doc.data().userId}"`);
+  }
+
+  // Check for newUserId
+  const newSnapshot = await coll.where("userId", "==", newUserId).get();
+  log.info(`debugListCollectionDocs: "${collectionName}" docs with userId="${newUserId}": ${newSnapshot.size}`);
+  for (const doc of newSnapshot.docs) {
+    log.debug(`  - Doc ID="${doc.id}", userId="${doc.data().userId}"`);
+  }
+
+  return {
+    oldCount: oldSnapshot.size,
+    newCount: newSnapshot.size,
+    oldDocs: oldSnapshot.docs.map((d) => d.id),
+    newDocs: newSnapshot.docs.map((d) => d.id),
+  };
+}
+
+/**
+ * Updates userId field in a collection for all documents matching oldUserId.
+ */
+async function updateCollectionUserIds(firestore, collectionName, oldUserId, newUserId) {
+  log.info(`updateCollectionUserIds: Processing collection "${collectionName}"`);
+  log.info(`updateCollectionUserIds: Looking for userId="${oldUserId}" to replace with "${newUserId}"`);
+
+  const coll = firestore.collection(collectionName);
+  const snapshot = await coll.where("userId", "==", oldUserId).get();
+
+  log.info(`updateCollectionUserIds: "${collectionName}" - found ${snapshot.size} docs with userId="${oldUserId}"`);
+
+  if (snapshot.empty) {
+    log.warn(`updateCollectionUserIds: "${collectionName}" - NO DOCUMENTS FOUND with userId="${oldUserId}"`);
+    return 0;
+  }
+
+  const batch = firestore.batch();
+  let updateCount = 0;
+
+  for (const docSnap of snapshot.docs) {
+    const ref = docSnap.ref;
+    const currentData = docSnap.data();
+    log.info(`updateCollectionUserIds: "${collectionName}" - UPDATING doc ID="${ref.id}"`);
+    log.debug(`updateCollectionUserIds: "${collectionName}" - doc "${ref.id}" current userId="${currentData.userId}"`);
+
+    batch.update(ref, {userId: newUserId});
+    updateCount++;
+  }
+
+  log.info(`updateCollectionUserIds: "${collectionName}" - committing batch for ${updateCount} docs`);
+  await batch.commit();
+  log.info(`updateCollectionUserIds: "${collectionName}" - batch committed successfully`);
+
+  return updateCount;
+}
+
+/**
+ * Performs the migration:
+ * 1. Find old user document and update its id field (if exists)
+ * 2. ALWAYS update userId in daily_tasks, face-analysis, meal-analysis collections
  */
 async function migrateUser(oldUserId, newUserId, db) {
-  console.log("[migrateUser] Starting migration", {
-    oldUserId: oldUserId || "(empty)",
-    newUserId: newUserId || "(empty)",
-    timestamp: new Date().toISOString(),
-  });
+  log.info("=".repeat(70));
+  log.info("migrateUser: STARTING MIGRATION");
+  log.info(`migrateUser: oldUserId="${oldUserId}"`);
+  log.info(`migrateUser: newUserId="${newUserId}"`);
+  log.info("=".repeat(70));
 
   const firestore = db || getFirestore();
+
+  // Validate inputs
   if (!newUserId || newUserId.trim() === "") {
-    console.error("[migrateUser] Error: newUserId is required");
+    log.error("migrateUser: FAILED - newUserId is required");
     return {ok: false, error: "newUserId is required"};
   }
-  const newUserIdTrimmed = newUserId.trim();
-  const oldUserIdTrimmed = (oldUserId || "").trim();
+  if (!oldUserId || oldUserId.trim() === "") {
+    log.error("migrateUser: FAILED - oldUserId is required");
+    return {ok: false, error: "oldUserId is required"};
+  }
 
-  console.log("[migrateUser] Trimmed IDs", {
-    oldUserIdTrimmed: oldUserIdTrimmed || "(empty)",
-    newUserIdTrimmed,
-  });
+  const oldUserIdTrimmed = oldUserId.trim();
+  const newUserIdTrimmed = newUserId.trim();
+
+  if (oldUserIdTrimmed === newUserIdTrimmed) {
+    log.error("migrateUser: FAILED - oldUserId and newUserId are the same");
+    return {ok: false, error: "oldUserId and newUserId must be different"};
+  }
+
+  // ==================== DEBUG: Check current state of all collections ====================
+  log.info("=".repeat(70));
+  log.info("migrateUser: DEBUG - Checking current state of all collections BEFORE migration");
+  log.info("=".repeat(70));
+
+  for (const collName of COLLECTIONS_TO_UPDATE) {
+    await debugListCollectionDocs(firestore, collName, oldUserIdTrimmed, newUserIdTrimmed);
+  }
+
+  // ==================== Step 1: Handle user document ====================
+  log.info("=".repeat(70));
+  log.info("migrateUser: Step 1 - Finding and updating user document...");
+  log.info("=".repeat(70));
 
   const usersColl = firestore.collection("users");
-  const newUserRef = usersColl.doc(newUserIdTrimmed);
+  const found = await findUserDoc(usersColl, oldUserIdTrimmed);
 
-  console.log("[migrateUser] Looking for user document", {
-    searchOldUserId: oldUserIdTrimmed || newUserIdTrimmed,
-    newUserIdTrimmed,
-  });
+  let userDocMigrated = false;
+  let newDocId = null;
 
-  const found = await findUserDocToMigrate(usersColl, oldUserIdTrimmed || newUserIdTrimmed, newUserIdTrimmed);
-  if (!found) {
-    console.log("[migrateUser] No user document found to migrate");
-    return {ok: true};
+  if (found) {
+    const {ref: oldUserRef, data: oldUserData} = found;
+    log.info(`migrateUser: Found old user doc at path="${oldUserRef.path}"`);
+    log.info(`migrateUser: Old user doc id field="${oldUserData?.id}"`);
+
+    // Create new document with auto-generated ID, copying all data and updating id field
+    const newUserData = {
+      ...oldUserData,
+      id: newUserIdTrimmed,
+    };
+
+    log.info("migrateUser: Creating new user document with auto-generated ID...");
+    const newDocRef = await usersColl.add(newUserData);
+    newDocId = newDocRef.id;
+    log.info(`migrateUser: Created new user document with ID="${newDocId}"`);
+
+    log.info(`migrateUser: Deleting old user document at path="${oldUserRef.path}"...`);
+    await oldUserRef.delete();
+    log.info("migrateUser: Old user document deleted");
+
+    userDocMigrated = true;
+  } else {
+    log.warn("migrateUser: No user document found for oldUserId - skipping user doc migration");
+    log.warn("migrateUser: Will still attempt to update other collections");
   }
 
-  const {ref: oldUserRef, data: userData, actualOldUserId} = found;
-  console.log("[migrateUser] Found user document", {
-    actualOldUserId,
-    oldDocId: oldUserRef.id,
-    newUserIdTrimmed,
-    userDataKeys: userData ? Object.keys(userData) : [],
-  });
+  // ==================== Step 2: Update related collections ====================
+  // IMPORTANT: We do this REGARDLESS of whether user doc was found
+  log.info("=".repeat(70));
+  log.info("migrateUser: Step 2 - Updating userId in related collections...");
+  log.info(`migrateUser: Collections to update: ${COLLECTIONS_TO_UPDATE.join(", ")}`);
+  log.info(`migrateUser: Searching for userId="${oldUserIdTrimmed}"`);
+  log.info(`migrateUser: Replacing with userId="${newUserIdTrimmed}"`);
+  log.info("=".repeat(70));
 
-  if (actualOldUserId === newUserIdTrimmed) {
-    console.log("[migrateUser] User already migrated (actualOldUserId === newUserIdTrimmed)");
-    return {ok: true};
+  const updateResults = {};
+  for (const collName of COLLECTIONS_TO_UPDATE) {
+    log.info(`migrateUser: Processing "${collName}"...`);
+    const count = await updateCollectionUserIds(firestore, collName, oldUserIdTrimmed, newUserIdTrimmed);
+    updateResults[collName] = count;
+    log.info(`migrateUser: "${collName}" - updated ${count} documents`);
   }
 
-  console.log("[migrateUser] Starting storage copy", {
-    fromUserId: actualOldUserId,
-    toUserId: newUserIdTrimmed,
-  });
-  const urlMap = await copyStorageForUser(actualOldUserId, newUserIdTrimmed);
-  console.log("[migrateUser] Storage copy completed", {
-    urlMapSize: urlMap.size,
-    urlMapEntries: Array.from(urlMap.entries()).slice(0, 5), // Log first 5 entries
-  });
+  // ==================== DEBUG: Check state AFTER migration ====================
+  log.info("=".repeat(70));
+  log.info("migrateUser: DEBUG - Checking state of all collections AFTER migration");
+  log.info("=".repeat(70));
 
-  // 1. Users: create new doc and delete old in one transaction so the collection never briefly disappears
-  const merged = {...userData, [USERS_ID_FIELD]: newUserIdTrimmed};
-  console.log("[migrateUser] Starting user document migration transaction", {
-    oldDocId: oldUserRef.id,
-    newDocId: newUserRef.id,
-    mergedKeys: Object.keys(merged),
-  });
-
-  await firestore.runTransaction(async (transaction) => {
-    console.log("[migrateUser] Transaction: Reading documents", {
-      oldDocId: oldUserRef.id,
-      newDocId: newUserRef.id,
-    });
-    const [oldSnap, newSnap] = await Promise.all([oldUserRef.get(), newUserRef.get()]);
-
-    console.log("[migrateUser] Transaction: Document states", {
-      oldDocExists: oldSnap.exists,
-      newDocExists: newSnap.exists,
-    });
-
-    if (!oldSnap.exists) {
-      console.log("[migrateUser] Transaction: Old document does not exist, skipping");
-      return;
-    }
-
-    const newData = newSnap.exists ? newSnap.data() : null;
-    const alreadyMigrated = newData && newData[USERS_ID_FIELD] === newUserIdTrimmed;
-
-    console.log("[migrateUser] Transaction: Migration check", {
-      alreadyMigrated,
-      newDataIdField: newData ? newData[USERS_ID_FIELD] : null,
-    });
-
-    if (alreadyMigrated) {
-      console.log("[migrateUser] Transaction: Already migrated, skipping");
-      return;
-    }
-
-    console.log("[migrateUser] Transaction: Setting new document and deleting old", {
-      newDocId: newUserRef.id,
-      oldDocId: oldUserRef.id,
-    });
-    transaction.set(newUserRef, merged);
-    transaction.delete(oldUserRef);
-  });
-
-  console.log("[migrateUser] User document migration completed");
-
-  // 2. Other collections: only update userId field (and imageUrl if needed) without replacing other data
-  console.log("[migrateUser] Starting collection updates", {
-    collections: SUBCOLLECTIONS_BY_USER_ID,
-    actualOldUserId,
-    newUserIdTrimmed,
-  });
-
-  for (const collName of SUBCOLLECTIONS_BY_USER_ID) {
-    console.log(`[migrateUser] Processing collection: ${collName}`, {
-      collectionName: collName,
-      queryUserId: actualOldUserId,
-    });
-
-    const coll = firestore.collection(collName);
-    console.log(`[migrateUser] Querying ${collName} for userId == ${actualOldUserId}`);
-
-    const snapshot = await coll.where("userId", "==", actualOldUserId).get();
-
-    console.log(`[migrateUser] Query result for ${collName}`, {
-      collectionName: collName,
-      documentCount: snapshot.size,
-      documentIds: snapshot.docs.map((d) => d.id),
-    });
-
-    if (snapshot.empty) {
-      console.log(`[migrateUser] No documents found in ${collName}, skipping`);
-      continue;
-    }
-
-    console.log(`[migrateUser] Preparing batch update for ${collName}`, {
-      collectionName: collName,
-      documentCount: snapshot.size,
-    });
-
-    const writer = firestore.batch();
-    let batchCount = 0;
-
-    for (const docSnap of snapshot.docs) {
-      const ref = docSnap.ref;
-      const originalData = docSnap.data();
-
-      console.log(`[migrateUser] Processing document in ${collName}`, {
-        collectionName: collName,
-        documentId: ref.id,
-        originalUserId: originalData.userId,
-        dataKeys: Object.keys(originalData),
-      });
-
-      // Build update object with only userId and any imageUrl fields that need updating
-      const updateFields = buildUpdateObject(originalData, actualOldUserId, newUserIdTrimmed, urlMap);
-
-      console.log(`[migrateUser] Update fields for ${collName}/${ref.id}`, {
-        collectionName: collName,
-        documentId: ref.id,
-        updateFields,
-        updateFieldKeys: Object.keys(updateFields),
-      });
-
-      // Use update() to only modify specified fields, preserving all other data
-      writer.update(ref, updateFields);
-      batchCount++;
-    }
-
-    console.log(`[migrateUser] Committing batch for ${collName}`, {
-      collectionName: collName,
-      batchSize: batchCount,
-    });
-
-    await writer.commit();
-
-    console.log(`[migrateUser] Successfully updated ${collName}`, {
-      collectionName: collName,
-      documentsUpdated: batchCount,
-    });
+  for (const collName of COLLECTIONS_TO_UPDATE) {
+    await debugListCollectionDocs(firestore, collName, oldUserIdTrimmed, newUserIdTrimmed);
   }
 
-  console.log("[migrateUser] Migration completed successfully", {
-    oldUserId: actualOldUserId,
-    newUserId: newUserIdTrimmed,
-    timestamp: new Date().toISOString(),
-  });
+  // ==================== Summary ====================
+  log.info("=".repeat(70));
+  log.info("migrateUser: MIGRATION COMPLETED");
+  log.info(`migrateUser: User doc migrated: ${userDocMigrated}`);
+  if (newDocId) {
+    log.info(`migrateUser: New user doc ID: ${newDocId}`);
+  }
+  log.info(`migrateUser: Collection updates: ${JSON.stringify(updateResults)}`);
+  log.info("=".repeat(70));
 
-  return {ok: true};
+  return {ok: true, userDocMigrated, newDocId, updateResults};
 }
 
 /**
@@ -968,12 +555,6 @@ async function deleteUser(userId, db) {
 }
 
 module.exports = {
-  copyStorageForUser,
   migrateUser,
-  rewriteEntries,
-  buildUpdateObject,
-  deleteUser,
-  deleteStorageForUser,
-  COLLECTIONS,
-  STORAGE_FOLDERS,
+  COLLECTIONS_TO_UPDATE,
 };
