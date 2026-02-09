@@ -17,6 +17,12 @@ const log = {
 // Collections that need userId updated
 const COLLECTIONS_TO_UPDATE = ["daily_tasks", "face-analysis", "meal-analysis", "reel_progress"];
 
+// Storage folders to delete user files from
+const STORAGE_FOLDERS = ["meals", "selfies"];
+
+// Field name for user ID in users collection
+const USERS_ID_FIELD = "id";
+
 /**
  * Finds the existing user document by document ID or by `id` field.
  */
@@ -392,7 +398,8 @@ async function deleteStorageFileFromUrl(url) {
  * Deletes a user and all their related documents from Firestore and Storage.
  * @param {string} userId - User ID to delete
  * @param {FirebaseFirestore.Firestore} [db]
- * @returns {Promise<{ ok: boolean, error?: string, deleted: { users: number, collections: Record<string, number>, storage: number } }>}
+ * @returns {Promise<{ ok: boolean, error?: string,
+ *   deleted: { users: number, collections: Record<string, number>, storage: number } }>}
  */
 async function deleteUser(userId, db) {
   console.log("[deleteUser] Starting user deletion", {
@@ -556,5 +563,6 @@ async function deleteUser(userId, db) {
 
 module.exports = {
   migrateUser,
+  deleteUser,
   COLLECTIONS_TO_UPDATE,
 };
