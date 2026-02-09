@@ -1,0 +1,206 @@
+{
+	"info": {
+		"_postman_id": "user-setup-api-collection",
+		"name": "User Setup API",
+		"description": "Collection for testing the User Setup API migration endpoint",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "1. Migrate User - New User ID Only",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"newUserId\": \"user-123-abc-def\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "https://usersetupapi-zoakaisvja-uc.a.run.app",
+					"protocol": "https",
+					"host": [
+						"usersetupapi-zoakaisvja-uc",
+						"a",
+						"run",
+						"app"
+					]
+				},
+				"description": "Migrates user data using only newUserId. The function will find the existing user document by id field and migrate it."
+			},
+			"response": []
+		},
+		{
+			"name": "2. Migrate User - With Old User ID",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"oldUserId\": \"old-user-123\",\n  \"newUserId\": \"new-user-456\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "https://usersetupapi-zoakaisvja-uc.a.run.app",
+					"protocol": "https",
+					"host": [
+						"usersetupapi-zoakaisvja-uc",
+						"a",
+						"run",
+						"app"
+					]
+				},
+				"description": "Migrates user data from oldUserId to newUserId. Updates all collections (daily_tasks, face-analysis, meal-analysis, videos) and copies storage files."
+			},
+			"response": []
+		},
+		{
+			"name": "3. Migrate User - Snake Case Format",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"old_user_id\": \"old-user-123\",\n  \"new_user_id\": \"new-user-456\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "https://usersetupapi-zoakaisvja-uc.a.run.app",
+					"protocol": "https",
+					"host": [
+						"usersetupapi-zoakaisvja-uc",
+						"a",
+						"run",
+						"app"
+					]
+				},
+				"description": "Tests the API with snake_case format (old_user_id, new_user_id) instead of camelCase."
+			},
+			"response": []
+		},
+		{
+			"name": "4. Error - Missing newUserId",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"oldUserId\": \"old-user-123\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "https://usersetupapi-zoakaisvja-uc.a.run.app",
+					"protocol": "https",
+					"host": [
+						"usersetupapi-zoakaisvja-uc",
+						"a",
+						"run",
+						"app"
+					]
+				},
+				"description": "Tests error handling when newUserId is missing. Should return 400 error."
+			},
+			"response": []
+		},
+		{
+			"name": "5. Error - Same oldUserId and newUserId",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"oldUserId\": \"user-123\",\n  \"newUserId\": \"user-123\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "https://usersetupapi-zoakaisvja-uc.a.run.app",
+					"protocol": "https",
+					"host": [
+						"usersetupapi-zoakaisvja-uc",
+						"a",
+						"run",
+						"app"
+					]
+				},
+				"description": "Tests error handling when oldUserId and newUserId are the same. Should return 400 error."
+			},
+			"response": []
+		},
+		{
+			"name": "6. Error - Wrong HTTP Method (GET)",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "https://usersetupapi-zoakaisvja-uc.a.run.app",
+					"protocol": "https",
+					"host": [
+						"usersetupapi-zoakaisvja-uc",
+						"a",
+						"run",
+						"app"
+					]
+				},
+				"description": "Tests error handling for wrong HTTP method. Should return 405 Method Not Allowed."
+			},
+			"response": []
+		}
+	],
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "https://usersetupapi-zoakaisvja-uc.a.run.app",
+			"type": "string"
+		}
+	]
+}
