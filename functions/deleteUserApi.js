@@ -1,10 +1,12 @@
 /**
  * Delete User API: HTTP endpoint that deletes a user and all their
  * related documents from Firestore and Storage.
+ * Requires Firebase ID token authentication and reauthentication.
  */
 
 const {onRequest} = require("firebase-functions/v2/https");
 const {getFirestore} = require("firebase-admin/firestore");
+const {getAuth} = require("firebase-admin/auth");
 const {deleteUser} = require("./userSetup/migration");
 
 const deleteUserApi = onRequest(
@@ -31,12 +33,58 @@ const deleteUserApi = onRequest(
       return;
     }
 
+    // ==================== Step 1: Verify Authentication Token ====================
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      console.error("[deleteUserApi] Missing or invalid Authorization header");
+      res.status(401).json({
+        ok: false,
+        error: "Authentication required. Send Firebase ID token in Authorization header: 'Bearer <token>'.",
+      });
+      return;
+    }
+
+    const idToken = authHeader.split("Bearer ")[1];
+    let decodedToken;
+    try {
+      const auth = getAuth();
+      decodedToken = await auth.verifyIdToken(idToken);
+      console.log("[deleteUserApi] Token verified", {
+        uid: decodedToken.uid,
+        email: decodedToken.email || null,
+      });
+    } catch (err) {
+      console.error("[deleteUserApi] Token verification failed", {
+        error: err.message,
+        code: err.code,
+      });
+      
+      // Handle specific Firebase Auth errors
+      if (err.code === "auth/id-token-expired") {
+        res.status(401).json({
+          ok: false,
+          error: "Token expired. Please reauthenticate and try again.",
+          requiresReauth: true,
+        });
+        return;
+      }
+      
+      res.status(401).json({
+        ok: false,
+        error: "Invalid authentication token. Please reauthenticate and try again.",
+        requiresReauth: true,
+      });
+      return;
+    }
+
+    // ==================== Step 2: Parse and Validate Request Body ====================
     const body = typeof req.body === "object" && req.body !== null ? req.body : {};
     const userId = (body.userId ?? body.user_id ?? "").toString().trim();
 
     console.log("[deleteUserApi] Parsed request body", {
       userId: userId || "(empty)",
       bodyKeys: Object.keys(body),
+      tokenUid: decodedToken.uid,
     });
 
     if (!userId) {
@@ -44,6 +92,20 @@ const deleteUserApi = onRequest(
       res.status(400).json({
         ok: false,
         error: "Missing userId. Send JSON: { userId }.",
+      });
+      return;
+    }
+
+    // ==================== Step 3: Verify User Authorization ====================
+    // Ensure the authenticated user can only delete their own account
+    if (decodedToken.uid !== userId) {
+      console.error("[deleteUserApi] User ID mismatch", {
+        tokenUid: decodedToken.uid,
+        requestedUserId: userId,
+      });
+      res.status(403).json({
+        ok: false,
+        error: "You can only delete your own account. Token UID does not match requested userId.",
       });
       return;
     }
