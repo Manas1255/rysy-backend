@@ -5,6 +5,7 @@
  */
 
 const {getFirestore} = require("firebase-admin/firestore");
+const {getAuth} = require("firebase-admin/auth");
 
 // Logging utility for consistent prefixed logs
 const log = {
@@ -15,7 +16,7 @@ const log = {
 };
 
 // Collections that need userId updated
-const COLLECTIONS_TO_UPDATE = ["daily_tasks", "face-analysis", "meal-analysis", "reel_progress"];
+const COLLECTIONS_TO_UPDATE = ["daily_tasks", "face-analysis", "meal-analysis", "reel_progress", "progress-photos"];
 
 // Storage folders to delete user files from
 const STORAGE_FOLDERS = ["meals", "selfies"];
@@ -396,10 +397,11 @@ async function deleteStorageFileFromUrl(url) {
 
 /**
  * Deletes a user and all their related documents from Firestore and Storage.
+ * Also deletes the Firebase Auth user.
  * @param {string} userId - User ID to delete
  * @param {FirebaseFirestore.Firestore} [db]
  * @returns {Promise<{ ok: boolean, error?: string,
- *   deleted: { users: number, collections: Record<string, number>, storage: number } }>}
+ *   deleted: { users: number, collections: Record<string, number>, storage: number, auth: boolean } }>}
  */
 async function deleteUser(userId, db) {
   console.log("[deleteUser] Starting user deletion", {
@@ -418,6 +420,7 @@ async function deleteUser(userId, db) {
     users: 0,
     collections: {},
     storage: 0,
+    auth: false,
   };
 
   try {
@@ -468,6 +471,7 @@ async function deleteUser(userId, db) {
       "videos",
       "reel_progress",
       "reels",
+      "progress-photos",
     ];
 
     for (const collName of collectionsToClean) {
@@ -495,6 +499,25 @@ async function deleteUser(userId, db) {
       let batchCount = 0;
 
       for (const docSnap of snapshot.docs) {
+        // For progress-photos collection, delete associated storage files
+        if (collName === "progress-photos") {
+          const docData = docSnap.data();
+          if (docData.originalPhotoUrl && typeof docData.originalPhotoUrl === "string") {
+            console.log(`[deleteUser] Deleting originalPhotoUrl from ${collName}`, {
+              documentId: docSnap.id,
+              url: docData.originalPhotoUrl.substring(0, 100),
+            });
+            await deleteStorageFileFromUrl(docData.originalPhotoUrl);
+          }
+          if (docData.progressPhotoUrl && typeof docData.progressPhotoUrl === "string") {
+            console.log(`[deleteUser] Deleting progressPhotoUrl from ${collName}`, {
+              documentId: docSnap.id,
+              url: docData.progressPhotoUrl.substring(0, 100),
+            });
+            await deleteStorageFileFromUrl(docData.progressPhotoUrl);
+          }
+        }
+
         batch.delete(docSnap.ref);
         batchCount++;
 
@@ -541,6 +564,33 @@ async function deleteUser(userId, db) {
       console.warn("[deleteUser] Storage deletion had errors", {
         errors: storageResult.errors,
       });
+    }
+
+    // 5. Delete Firebase Auth user
+    try {
+      const auth = getAuth();
+      await auth.deleteUser(userIdTrimmed);
+      deleted.auth = true;
+      console.log("[deleteUser] Deleted Firebase Auth user", {
+        userId: userIdTrimmed,
+      });
+    } catch (authErr) {
+      // If user doesn't exist in Auth, that's okay - log and continue
+      if (authErr.code === "auth/user-not-found") {
+        console.log("[deleteUser] Firebase Auth user not found (may have been already deleted)", {
+          userId: userIdTrimmed,
+        });
+        deleted.auth = false;
+      } else {
+        console.error("[deleteUser] Error deleting Firebase Auth user", {
+          userId: userIdTrimmed,
+          error: authErr.message,
+          code: authErr.code,
+        });
+        // Don't fail the entire operation if Auth deletion fails
+        // but log the error
+        deleted.auth = false;
+      }
     }
 
     console.log("[deleteUser] User deletion completed successfully", {

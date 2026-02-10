@@ -7,6 +7,52 @@ const TASK_FIELDS = ["activity", "education", "hydration", "nutrition", "recover
 const DAILY_TASKS_COLLECTION = "daily_tasks";
 const USERS_COLLECTION = "users";
 const DEFAULT_TIMEZONE = "Asia/Karachi";
+/** Default UTC offset in minutes when user timezone is missing or invalid (Asia/Karachi = UTC+5). */
+const DEFAULT_OFFSET_MINUTES = 5 * 60;
+
+/**
+ * Parses user timezone string from Firestore (e.g. "UTC+5", "UTC+5:30", "UTC-3").
+ * @param {string|null|undefined} value - Raw timezone (e.g. "UTC+5", "UTC+5:30")
+ * @returns {number} Offset from UTC in minutes (e.g. 300 for UTC+5, 330 for UTC+5:30)
+ */
+function parseTimezoneToOffsetMinutes(value) {
+  if (value == null || typeof value !== "string") return DEFAULT_OFFSET_MINUTES;
+  const s = value.trim();
+  const match = /^UTC([+-])(\d+)(?::(\d+))?$/i.exec(s);
+  if (!match) return DEFAULT_OFFSET_MINUTES;
+  const sign = match[1] === "+" ? 1 : -1;
+  const hours = parseInt(match[2], 10) || 0;
+  const minutes = parseInt(match[3], 10) || 0;
+  return sign * (hours * 60 + minutes);
+}
+
+/**
+ * Returns local date and time for a given UTC offset (user's "now").
+ * @param {number} offsetMinutes - Offset from UTC in minutes (e.g. 300 for UTC+5)
+ * @param {number} [nowMs] - Current time in ms (default: Date.now())
+ * @returns {{ dateYmd: string, hour: number, minute: number }}
+ */
+function getLocalTimeForOffset(offsetMinutes, nowMs = Date.now()) {
+  const d = new Date(nowMs + offsetMinutes * 60 * 1000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return {
+    dateYmd: `${y}-${m}-${day}`,
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+  };
+}
+
+/**
+ * Returns today's date as YYYY-MM-DD for a given UTC offset.
+ * @param {number} offsetMinutes - Offset from UTC in minutes
+ * @param {number} [nowMs] - Current time in ms (default: Date.now())
+ * @returns {string} YYYY-MM-DD
+ */
+function getTodayYMDForOffset(offsetMinutes, nowMs = Date.now()) {
+  return getLocalTimeForOffset(offsetMinutes, nowMs).dateYmd;
+}
 
 /**
  * Returns today's date as YYYY-MM-DD in the given timezone.
@@ -87,6 +133,10 @@ module.exports = {
   DAILY_TASKS_COLLECTION,
   USERS_COLLECTION,
   DEFAULT_TIMEZONE,
+  DEFAULT_OFFSET_MINUTES,
+  parseTimezoneToOffsetMinutes,
+  getLocalTimeForOffset,
+  getTodayYMDForOffset,
   getTodayYMD,
   getYesterdayYMD,
   getDayAfterYYYYMMDD,
