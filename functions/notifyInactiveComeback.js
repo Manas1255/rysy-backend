@@ -39,21 +39,39 @@ function getInactiveState(userData, nowMs) {
 
 function getMessageForMilestone(days) {
   if (days === 3) {
-    return { title: "We miss you!", body: "It's been a few days — your glow-up journey is waiting. Open the app and keep your streak alive!" };
+    return {
+      title: "We miss you!",
+      body: "It's been a few days — your glow-up journey is waiting. Open the app and keep your streak alive!",
+    };
   }
   if (days === 7) {
-    return { title: "Come back to your routine", body: "A week without you! Your goals are still here. Open the app and pick up where you left off." };
+    return {
+      title: "Come back to your routine",
+      body: "A week without you! Your goals are still here. Open the app and pick up where you left off.",
+    };
   }
   if (days === 14) {
-    return { title: "Your streak is calling", body: "Two weeks ago you were building something great. Open the app and start again — we're here for you." };
+    return {
+      title: "Your streak is calling",
+      body: "Two weeks ago you were building something great. Open the app and start again — we're here for you.",
+    };
   }
   if (days === 21) {
-    return { title: "Ready when you are", body: "Three weeks — no pressure. When you're ready, open the app and we'll help you get back on track." };
+    return {
+      title: "Ready when you are",
+      body: "Three weeks — no pressure. When you're ready, open the app and we'll help you get back on track.",
+    };
   }
   if (days === 30) {
-    return { title: "A month without you", body: "Your glow-up journey is still here. Open the app and make today the day you come back." };
+    return {
+      title: "A month without you",
+      body: "Your glow-up journey is still here. Open the app and make today the day you come back.",
+    };
   }
-  return { title: "We're still here", body: "Your goals haven't gone anywhere. Open the app when you're ready to continue your glow-up." };
+  return {
+    title: "We're still here",
+    body: "Your goals haven't gone anywhere. Open the app when you're ready to continue your glow-up.",
+  };
 }
 
 const notifyInactiveComeback = onSchedule(

@@ -58,7 +58,8 @@ const notifyStreakAboutToBreak = onSchedule(
 
         const result = await sendPushToUser(userId, {
           title: "Your streak is about to break",
-          body: "You have about an hour left — complete at least one task before midnight to keep your glow-up streak alive!",
+          body: "You have about an hour left — complete at least one task before midnight to keep your "
+            + "glow-up streak alive!",
           data: {type: "streak_about_to_break"},
         }, db);
 
