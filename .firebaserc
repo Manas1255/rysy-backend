@@ -1,5 +1,7 @@
 {
   "projects": {
-    "default": "rysy-dev"
+    "default": "rysy-dev",
+    "dev": "rysy-dev",
+    "prod": "rysy-prod"  
   }
 }

@@ -1,7 +1,7 @@
 /**
  * Scheduled function every hour: sends "come back" push at 10am in each user's
- * local time to users who haven't opened the app for 3+ days. Milestones: 3, 7,
- * 14, 21, 30 days, then once every 30 days. Uses user "timezone" (e.g. "UTC+5").
+ * local time to users inactive 3+ days (based on users.lastLoggedIn). Milestones:
+ * 3, 7, 14, 21, 30 days, then once every 30 days. Uses user "timezone" (e.g. "UTC+5").
  */
 
 const {onSchedule} = require("firebase-functions/v2/scheduler");
@@ -9,7 +9,9 @@ const {getFirestore} = require("firebase-admin/firestore");
 const {
   parseTimezoneToOffsetMinutes,
   getLocalTimeForOffset,
+  normalizeTaskDateToYYYYMMDD,
   USERS_COLLECTION,
+  DAILY_TASKS_COLLECTION,
 } = require("./streaks");
 const {sendPushToUser} = require("./notifications/service");
 
@@ -27,9 +29,9 @@ function toDate(value) {
 }
 
 function getInactiveState(userData, nowMs) {
-  const lastActiveAt = toDate(userData.lastActiveAt);
-  if (!lastActiveAt) return {daysInactive: 0, lastSentAt: null, lastMilestone: null};
-  const daysInactive = Math.floor((nowMs - lastActiveAt.getTime()) / MS_PER_DAY);
+  const lastLoggedIn = toDate(userData.lastLoggedIn);
+  if (!lastLoggedIn) return {daysInactive: 0, lastSentAt: null, lastMilestone: null};
+  const daysInactive = Math.floor((nowMs - lastLoggedIn.getTime()) / MS_PER_DAY);
   const lastSentAt = toDate(userData.lastInactiveNotificationSentAt);
   const lastMilestone = typeof userData.lastInactiveNotificationMilestone === "number"
     ? userData.lastInactiveNotificationMilestone
@@ -86,11 +88,12 @@ const notifyInactiveComeback = onSchedule(
     const threeDaysAgo = new Date(nowMs - 3 * MS_PER_DAY);
 
     const snapshot = await db.collection(USERS_COLLECTION)
-      .where("lastActiveAt", "<", threeDaysAgo)
+      .where("lastLoggedIn", "<", threeDaysAgo)
       .get();
 
+    // First pass: collect candidates that pass timezone + milestone checks
+    const candidates = [];
     for (const doc of snapshot.docs) {
-      const userId = doc.id;
       const userData = doc.data();
       const offsetMin = parseTimezoneToOffsetMinutes(userData.timezone);
       const {hour: localHour} = getLocalTimeForOffset(offsetMin, nowMs);
@@ -122,7 +125,32 @@ const notifyInactiveComeback = onSchedule(
       }
 
       if (!sendNow || milestoneToSend === null) continue;
+      candidates.push({doc, milestoneToSend});
+    }
 
+    if (candidates.length === 0) return;
+
+    // Safety net: batch-fetch daily_tasks to catch users active since lastLoggedIn was written
+    const dailyTasksRefs = candidates.map(({doc}) =>
+      db.collection(DAILY_TASKS_COLLECTION).doc(doc.id)
+    );
+    const dailyTasksSnaps = await db.getAll(...dailyTasksRefs);
+    const dailyTasksMap = {};
+    for (const snap of dailyTasksSnaps) {
+      dailyTasksMap[snap.id] = snap.exists ? snap.data() : null;
+    }
+
+    // Second pass: skip users with recent daily_tasks activity, send to the rest
+    for (const {doc, milestoneToSend} of candidates) {
+      const taskData = dailyTasksMap[doc.id];
+      if (taskData && taskData.taskDate) {
+        const taskDateStr = normalizeTaskDateToYYYYMMDD(taskData.taskDate);
+        if (taskDateStr && new Date(taskDateStr).getTime() >= threeDaysAgo.getTime()) {
+          continue; // user has recent app activity, skip
+        }
+      }
+
+      const userId = doc.id;
       const {title, body} = getMessageForMilestone(milestoneToSend);
       const result = await sendPushToUser(userId, {
         title,

@@ -99,6 +99,10 @@ function subscriptionFromEvent(event, config) {
     if (!planType) return null;
     return buildActiveSubscription(event, planType);
 
+  case "NON_RENEWING_PURCHASE":
+    if (!planType) return null;
+    return buildActiveSubscription(event, planType);
+
   case "TEMPORARY_ENTITLEMENT_GRANT":
     if (planType) return buildActiveSubscription(event, planType);
     return null;
@@ -106,7 +110,6 @@ function subscriptionFromEvent(event, config) {
   case "TEST":
   case "BILLING_ISSUE":
   case "SUBSCRIPTION_PAUSED":
-  case "NON_RENEWING_PURCHASE":
   case "TRANSFER":
   case "INVOICE_ISSUANCE":
   case "VIRTUAL_CURRENCY_TRANSACTION":

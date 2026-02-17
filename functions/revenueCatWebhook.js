@@ -25,6 +25,12 @@ function resolveUserIds(event) {
     return id ? [id] : [];
   }
 
+  // Prefer Firebase UID set by the app via subscriber attributes
+  const firebaseId = event.subscriber_attributes?.firebaseId?.value;
+  if (firebaseId && typeof firebaseId === "string" && firebaseId.trim()) {
+    return [firebaseId.trim()];
+  }
+
   const primary = (event.app_user_id || event.original_app_user_id || "").trim();
   return primary ? [primary] : [];
 }
