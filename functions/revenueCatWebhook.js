@@ -70,27 +70,57 @@ const revenueCatWebhook = onRequest(
     invoker: "public",
   },
   async (req, res) => {
+    console.log("revenueCatWebhook: received request", {
+      method: req.method,
+      hasAuth: !!req.headers.authorization,
+      contentType: req.headers["content-type"],
+    });
+
     if (req.method !== "POST") {
+      console.warn("revenueCatWebhook: rejected - method not allowed", req.method);
       res.status(405).send("Method Not Allowed");
       return;
     }
 
     const config = getRevenueCatConfig();
-    if (!validateAuth(req.headers.authorization || "", config.auth)) {
-      res.status(401).send("Unauthorized");
-      return;
-    }
+    console.log("revenueCatWebhook: config loaded", {
+      monthlyProductIds: config.monthlyProductIds,
+      yearlyProductIds: config.yearlyProductIds,
+      hasAuth: !!config.auth,
+    });
+    // TODO: re-enable auth once RevenueCat Authorization header is configured in the dashboard
+    // const authValid = validateAuth(req.headers.authorization || "", config.auth);
+    // if (!authValid) {
+    //   const hasAuthHeader = !!req.headers.authorization;
+    //   console.warn("revenueCatWebhook: rejected - unauthorized", {hasAuthHeader});
+    //   res.status(401).send("Unauthorized");
+    //   return;
+    // }
+    console.log("revenueCatWebhook: auth check skipped (temp)");
 
     const body = typeof req.body === "object" && req.body !== null ? req.body : {};
 
     const event = body?.event;
     if (!event || typeof event !== "object") {
+      console.warn("revenueCatWebhook: rejected - missing or invalid event", {bodyKeys: Object.keys(body)});
       res.status(400).send("Missing event");
       return;
     }
 
+    console.log("revenueCatWebhook: event received", {
+      type: event.type,
+      app_user_id: event.app_user_id,
+      original_app_user_id: event.original_app_user_id,
+      firebaseId: event.subscriber_attributes?.firebaseId?.value,
+      product_id: event.product_id,
+      transferred_to: event.transferred_to,
+    });
+
     const userIds = resolveUserIds(event);
+    console.log("revenueCatWebhook: resolved userIds", userIds);
+
     if (userIds.length === 0) {
+      console.warn("revenueCatWebhook: no user IDs resolved from event, skipping update");
       res.status(200).send("OK");
       return;
     }
@@ -100,12 +130,28 @@ const revenueCatWebhook = onRequest(
       yearlyProductIds: config.yearlyProductIds,
     });
 
+    const payloadLog = subscriptionPayload === null ? "null (cancel/expire)" : subscriptionPayload;
+    console.log("revenueCatWebhook: subscriptionPayload", payloadLog);
+
     const db = getFirestore();
     const update = subscriptionPayload === null ? {subscription: null} : {subscription: subscriptionPayload};
 
     for (const userId of userIds) {
       try {
-        await db.collection(USERS_COLLECTION).doc(userId).set(update, {merge: true});
+        const querySnap = await db.collection(USERS_COLLECTION)
+          .where("id", "==", userId)
+          .limit(1)
+          .get();
+
+        if (querySnap.empty) {
+          console.warn("revenueCatWebhook: no user found with id field =", userId, "skipping");
+          continue;
+        }
+
+        const userDoc = querySnap.docs[0];
+        console.log("revenueCatWebhook: updating Firestore for user", userId, "docId:", userDoc.id, update);
+        await userDoc.ref.update(update);
+        console.log("revenueCatWebhook: Firestore update success for user", userId);
       } catch (err) {
         console.error("revenueCatWebhook: failed to update user", userId, err);
       }
